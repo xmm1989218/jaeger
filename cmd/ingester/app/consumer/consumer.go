@@ -42,8 +42,8 @@ type Consumer struct {
 	internalConsumer consumer.Consumer
 	processorFactory ProcessorFactory
 
-	close    chan struct{}
-	isClosed sync.WaitGroup
+	close                     chan struct{}
+	partitionToProcessorState map[int32]*sync.WaitGroup
 }
 
 // New is a constructor for a Consumer
@@ -52,7 +52,6 @@ func New(params Params) (*Consumer, error) {
 		metricsFactory:   params.Factory,
 		logger:           params.Logger,
 		close:            make(chan struct{}, 1),
-		isClosed:         sync.WaitGroup{},
 		internalConsumer: params.InternalConsumer,
 		processorFactory: params.ProcessorFactory,
 	}, nil
@@ -60,29 +59,47 @@ func New(params Params) (*Consumer, error) {
 
 // Start begins consuming messages in a go routine
 func (c *Consumer) Start() {
-	c.isClosed.Add(1)
 	c.logger.Info("Starting main loop")
 	go c.mainLoop()
 }
 
 // Close closes the Consumer and underlying sarama consumer
 func (c *Consumer) Close() error {
-	close(c.close)
-	c.isClosed.Wait()
-	return c.internalConsumer.Close()
+	c.logger.Info("Closing consumer")
+
+	for k, wg := range c.partitionToProcessorState {
+		c.logger.Info("Waiting to close partition", zap.Int32("partition", k))
+		wg.Wait()
+		c.logger.Info("Closed partition", zap.Int32("partition", k))
+	}
+
+	err := c.internalConsumer.Close()
+	if err != nil {
+		return nil
+	}
+
+	return nil
 }
 
 func (c *Consumer) mainLoop() {
 	for {
 		select {
 		case pc := <-c.internalConsumer.Partitions():
-			c.isClosed.Add(2)
 
+			if wg, ok := c.partitionToProcessorState[pc.Partition()]; ok {
+				wg.Wait()
+				delete(c.partitionToProcessorState, pc.Partition())
+			}
+			c.partitionToProcessorState[pc.Partition()] = &sync.WaitGroup{}
+
+			c.partitionToProcessorState[pc.Partition()].Add(1)
 			go c.handleMessages(pc)
+
+			c.partitionToProcessorState[pc.Partition()].Add(1)
 			go c.handleErrors(pc.Partition(), pc.Errors())
 
 		case <-c.close:
-			c.isClosed.Done()
+			c.logger.Info("Closing main loop")
 			return
 		}
 	}
@@ -90,8 +107,8 @@ func (c *Consumer) mainLoop() {
 
 func (c *Consumer) handleMessages(pc sc.PartitionConsumer) {
 	c.logger.Info("Starting message handler")
-	defer c.isClosed.Done()
 	defer c.closePartition(pc)
+	defer c.partitionToProcessorState[pc.Partition()].Done()
 
 	msgMetrics := c.newMsgMetrics(pc.Partition())
 	var msgProcessor processor.SpanProcessor
@@ -108,7 +125,9 @@ func (c *Consumer) handleMessages(pc sc.PartitionConsumer) {
 		}
 
 		msgProcessor.Process(&saramaMessageWrapper{msg})
+		c.logger.Info("finished processing messages")
 	}
+	c.logger.Info("finished handling messages")
 }
 
 func (c *Consumer) closePartition(partitionConsumer sc.PartitionConsumer) {
@@ -119,7 +138,7 @@ func (c *Consumer) closePartition(partitionConsumer sc.PartitionConsumer) {
 
 func (c *Consumer) handleErrors(partition int32, errChan <-chan *sarama.ConsumerError) {
 	c.logger.Info("Starting error handler")
-	defer c.isClosed.Done()
+	defer c.partitionToProcessorState[partition].Done()
 
 	errMetrics := c.newErrMetrics(partition)
 	for err := range errChan {
