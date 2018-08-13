@@ -15,33 +15,36 @@
 package consumer
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Shopify/sarama"
+	smocks "github.com/Shopify/sarama/mocks"
 	"github.com/bsm/sarama-cluster"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"github.com/uber/jaeger-lib/metrics"
 	"github.com/uber/jaeger-lib/metrics/testutils"
 	"go.uber.org/zap"
 
 	kmocks "github.com/jaegertracing/jaeger/cmd/ingester/app/consumer/mocks"
+	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor"
 	pmocks "github.com/jaegertracing/jaeger/cmd/ingester/app/processor/mocks"
-	"github.com/Shopify/sarama/mocks"
-	"fmt"
+	"github.com/jaegertracing/jaeger/pkg/kafka/consumer"
 )
 
 //go:generate mockery -dir ../../../../pkg/kafka/config/ -name Consumer
 //go:generate mockery -dir ../../../../../vendor/github.com/bsm/sarama-cluster/ -name PartitionConsumer
 
-type consumerTest struct {
-	saramaConsumer    *kmocks.Consumer
-	consumer          *Consumer
-	partitionConsumer *kmocks.PartitionConsumer
-}
+const (
+	topic     = "morekuzambu"
+	partition = int32(316)
+	msgOffset = int64(1111110111111)
+)
 
 func TestConstructor(t *testing.T) {
 	newConsumer, err := New(Params{})
@@ -49,238 +52,137 @@ func TestConstructor(t *testing.T) {
 	assert.NotNil(t, newConsumer)
 }
 
-func withWrappedConsumer(fn func(c *consumerTest)) {
-	sc := &kmocks.Consumer{}
+// partitionConsumerWrapper wraps a Sarama partition consumer into a Sarama cluster partition consumer
+type partitionConsumerWrapper struct {
+	topic     string
+	partition int32
+
+	sarama.PartitionConsumer
+}
+
+func (s partitionConsumerWrapper) Partition() int32 {
+	return s.partition
+}
+
+func (s partitionConsumerWrapper) Topic() string {
+	return s.topic
+}
+
+func newSaramaClusterConsumer(saramaPartitionConsumer sarama.PartitionConsumer) *kmocks.Consumer {
+	pcha := make(chan cluster.PartitionConsumer, 1)
+	pcha <- &partitionConsumerWrapper{
+		topic:             topic,
+		partition:         partition,
+		PartitionConsumer: saramaPartitionConsumer,
+	}
+	saramaClusterConsumer := &kmocks.Consumer{}
+	saramaClusterConsumer.On("Partitions").Return((<-chan cluster.PartitionConsumer)(pcha))
+	saramaClusterConsumer.On("Close").Return(nil)
+	saramaClusterConsumer.On("MarkPartitionOffset", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
+	return saramaClusterConsumer
+}
+
+func newConsumer(
+	factory metrics.Factory,
+	topic string,
+	processor processor.SpanProcessor,
+	consumer consumer.Consumer) *Consumer {
+
 	logger, _ := zap.NewDevelopment()
-	metricsFactory := metrics.NewLocalFactory(0)
-	c := &consumerTest{
-		saramaConsumer: sc,
-		consumer: &Consumer{
-			metricsFactory: metricsFactory,
+	return &Consumer{
+		metricsFactory:   factory,
+		logger:           logger,
+		close:            make(chan struct{}),
+		isClosed:         sync.WaitGroup{},
+		internalConsumer: consumer,
+
+		processorFactory: ProcessorFactory{
+			topic:          topic,
+			consumer:       consumer,
+			metricsFactory: factory,
 			logger:         logger,
-			close:          make(chan struct{}),
-			partitionToProcessorState: make(map[int32]*sync.WaitGroup),
-			internalConsumer:          sc,
-			processorFactory: ProcessorFactory{
-				topic:          "topic",
-				consumer:       sc,
-				metricsFactory: metricsFactory,
-				logger:         logger,
-				baseProcessor:  &pmocks.SpanProcessor{},
-				parallelism:    1,
-			},
+			baseProcessor:  processor,
+			parallelism:    1,
 		},
 	}
-
-	c.partitionConsumer = &kmocks.PartitionConsumer{}
-	pcha := make(chan cluster.PartitionConsumer, 1)
-	pcha <- c.partitionConsumer
-	c.saramaConsumer.On("Partitions").Return((<-chan cluster.PartitionConsumer)(pcha))
-	c.saramaConsumer.On("Close").Return(nil)
-	c.saramaConsumer.On("MarkPartitionOffset", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-
-	fn(c)
 }
 
 func TestSaramaConsumerWrapper_MarkPartitionOffset(t *testing.T) {
-	withWrappedConsumer(func(c *consumerTest) {
-		topic := "morekuzambu"
-		partition := int32(316)
-		offset := int64(1111110111111)
-		metadata := "meatbag"
-		c.saramaConsumer.On("MarkPartitionOffset", topic, partition, offset, metadata).Return()
-
-		c.saramaConsumer.MarkPartitionOffset(topic, partition, offset, metadata)
-
-		c.saramaConsumer.AssertCalled(t, "MarkPartitionOffset", topic, partition, offset, metadata)
-	})
+	sc := &kmocks.Consumer{}
+	metadata := "meatbag"
+	sc.On("MarkPartitionOffset", topic, partition, msgOffset, metadata).Return()
+	sc.MarkPartitionOffset(topic, partition, msgOffset, metadata)
+	sc.AssertCalled(t, "MarkPartitionOffset", topic, partition, msgOffset, metadata)
 }
 
 func TestSaramaConsumerWrapper_start_Messages(t *testing.T) {
-	withWrappedConsumer(func(c *consumerTest) {
-		msg := &sarama.ConsumerMessage{}
-		msg.Offset = 0
-		msgCh := make(chan *sarama.ConsumerMessage, 1)
-		msgCh <- msg
+	localFactory := metrics.NewLocalFactory(0)
 
-		errCh := make(chan *sarama.ConsumerError, 1)
-		c.partitionConsumer.On("Partition").Return(int32(0))
-		c.partitionConsumer.On("Errors").Return((<-chan *sarama.ConsumerError)(errCh))
-		c.partitionConsumer.On("Messages").Return((<-chan *sarama.ConsumerMessage)(msgCh))
-		c.partitionConsumer.On("HighWaterMarkOffset").Return(int64(1234))
-		c.partitionConsumer.On("Close").Return(nil)
+	msg := &sarama.ConsumerMessage{}
 
-		mp := &pmocks.SpanProcessor{}
-		mp.On("Process", &saramaMessageWrapper{msg}).Return(nil)
-		c.consumer.processorFactory.baseProcessor = mp
+	isProcessed := sync.WaitGroup{}
+	isProcessed.Add(1)
+	mp := &pmocks.SpanProcessor{}
+	mp.On("Process", &saramaMessageWrapper{msg}).Return(func(msg processor.Message) error {
+		isProcessed.Done()
+		return nil
+	})
 
-		c.consumer.Start()
-		time.Sleep(100 * time.Millisecond)
-		close(msgCh)
-		close(errCh)
-		c.consumer.Close()
+	saramaConsumer := smocks.NewConsumer(t, &sarama.Config{})
+	mc := saramaConsumer.ExpectConsumePartition(topic, partition, msgOffset)
+	mc.ExpectMessagesDrainedOnClose()
 
-		mp.AssertExpectations(t)
+	saramaPartitionConsumer, e := saramaConsumer.ConsumePartition(topic, partition, msgOffset)
+	require.NoError(t, e)
 
-		f := (c.consumer.metricsFactory).(*metrics.LocalFactory)
-		partitionTag := map[string]string{"partition": "0"}
-		testutils.AssertCounterMetrics(t, f, testutils.ExpectedMetric{
-			Name:  "sarama-consumer.messages",
-			Tags:  partitionTag,
-			Value: 1,
-		})
-		testutils.AssertGaugeMetrics(t, f, testutils.ExpectedMetric{
-			Name:  "sarama-consumer.current-offset",
-			Tags:  partitionTag,
-			Value: 0,
-		})
-		testutils.AssertGaugeMetrics(t, f, testutils.ExpectedMetric{
-			Name:  "sarama-consumer.offset-lag",
-			Tags:  partitionTag,
-			Value: 1233,
-		})
+	undertest := newConsumer(localFactory, topic, mp, newSaramaClusterConsumer(saramaPartitionConsumer))
+
+	undertest.Start()
+	mc.YieldMessage(msg)
+	isProcessed.Wait()
+
+	mp.AssertExpectations(t)
+	saramaConsumer.Close()
+
+	partitionTag := map[string]string{"partition": fmt.Sprint(partition)}
+	testutils.AssertCounterMetrics(t, localFactory, testutils.ExpectedMetric{
+		Name:  "sarama-consumer.messages",
+		Tags:  partitionTag,
+		Value: 1,
+	})
+	testutils.AssertGaugeMetrics(t, localFactory, testutils.ExpectedMetric{
+		Name:  "sarama-consumer.current-offset",
+		Tags:  partitionTag,
+		Value: 1,
+	})
+	testutils.AssertGaugeMetrics(t, localFactory, testutils.ExpectedMetric{
+		Name:  "sarama-consumer.offset-lag",
+		Tags:  partitionTag,
+		Value: 0,
 	})
 }
 
 func TestSaramaConsumerWrapper_start_Errors(t *testing.T) {
-	withWrappedConsumer(func(c *consumerTest) {
-		errCh := make(chan *sarama.ConsumerError, 1)
-		errCh <- &sarama.ConsumerError{
-			Topic: "some-topic",
-			Err:   errors.New("some error"),
-		}
+	localFactory := metrics.NewLocalFactory(0)
 
-		msgCh := make(chan *sarama.ConsumerMessage)
+	saramaConsumer := smocks.NewConsumer(t, &sarama.Config{})
+	mc := saramaConsumer.ExpectConsumePartition(topic, partition, msgOffset)
+	mc.ExpectErrorsDrainedOnClose()
 
-		c.partitionConsumer.On("Partition").Return(int32(0))
-		c.partitionConsumer.On("Errors").Return((<-chan *sarama.ConsumerError)(errCh))
-		c.partitionConsumer.On("Messages").Return((<-chan *sarama.ConsumerMessage)(msgCh))
-		c.partitionConsumer.On("Close").Return(nil)
+	saramaPartitionConsumer, e := saramaConsumer.ConsumePartition(topic, partition, msgOffset)
+	require.NoError(t, e)
 
-		c.consumer.Start()
-		time.Sleep(100 * time.Millisecond)
-		close(msgCh)
-		close(errCh)
-		c.consumer.Close()
-		f := (c.consumer.metricsFactory).(*metrics.LocalFactory)
-		partitionTag := map[string]string{"partition": "0"}
-		testutils.AssertCounterMetrics(t, f, testutils.ExpectedMetric{
-			Name:  "sarama-consumer.errors",
-			Tags:  partitionTag,
-			Value: 1,
-		})
+	undertest := newConsumer(localFactory, topic, &pmocks.SpanProcessor{}, newSaramaClusterConsumer(saramaPartitionConsumer))
+
+	undertest.Start()
+	mc.YieldError(errors.New("Daisy, Daisy"))
+	time.Sleep(100 * time.Millisecond)
+	saramaConsumer.Close()
+
+	partitionTag := map[string]string{"partition": fmt.Sprint(partition)}
+	testutils.AssertCounterMetrics(t, localFactory, testutils.ExpectedMetric{
+		Name:  "sarama-consumer.errors",
+		Tags:  partitionTag,
+		Value: 1,
 	})
-}
-
-func makePartitionConsumer(mockConsumer *mocks.Consumer, topic string, partition int32) saramaMockBackedClusterPartitionConsumer {
-	fmt.Println("1")
-	partitionConsumer := mockConsumer.ExpectConsumePartition(topic, partition, 0)
-	fmt.Println("2")
-	go func() {
-		time.Sleep(1 * time.Second)
-		partitionConsumer.YieldMessage(&sarama.ConsumerMessage{
-			Key:            nil,
-			Value:          nil,
-			Topic:          topic,
-			Partition:      partition,
-			Offset:         0,
-			Timestamp:      time.Now(),
-			BlockTimestamp: time.Now(),
-		})
-		time.Sleep(1 * time.Second)
-		fmt.Println("Closing partition consumer")
-		partitionConsumer.Close()
-	}()
-
-	fmt.Println("3")
-	pc , _ := mockConsumer.ConsumePartition(topic, partition, 0)
-	return saramaMockBackedClusterPartitionConsumer{
-		PartitionConsumer: pc,
-		topic:             topic,
-		partition:         partition,
-	}
-}
-
-type saramaMockBackedClusterPartitionConsumer struct {
-	sarama.PartitionConsumer
-	topic     string
-	partition int32
-}
-
-func (s saramaMockBackedClusterPartitionConsumer) Topic() string {
-	return s.topic
-}
-
-func (s saramaMockBackedClusterPartitionConsumer) Partition() int32 {
-	return s.partition
-}
-
-func TestStartStop(t *testing.T) {
-	sc := &kmocks.Consumer{}
-	logger, _ := zap.NewDevelopment()
-	metricsFactory := metrics.NewLocalFactory(0)
-
-	mp := &pmocks.SpanProcessor{}
-	mp.On("Process", mock.Anything).Return(nil)
-
-	testingConsumer := &Consumer{
-		metricsFactory: metricsFactory,
-		logger:         logger,
-		close:          make(chan struct{}),
-		partitionToProcessorState: make(map[int32]*sync.WaitGroup),
-		internalConsumer:          sc,
-		processorFactory: ProcessorFactory{
-			topic:          "topic",
-			consumer:       sc,
-			metricsFactory: metricsFactory,
-			logger:         logger,
-			baseProcessor:  mp,
-			parallelism:    1,
-		}}
-
-	mockConsumer := mocks.NewConsumer(t, &sarama.Config{})
-	mockConsumer.Close()
-
-	pcha := make(chan cluster.PartitionConsumer, 1)
-	fmt.Println("boo")
-	pc := makePartitionConsumer(mockConsumer, "boop", 1)
-	pcha <- pc
-	fmt.Println("booing")
-	sc.On("Partitions").Return((<-chan cluster.PartitionConsumer)(pcha))
-	sc.On("Close").Return(nil)
-	sc.On("MarkPartitionOffset", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-
-	testingConsumer.Start()
-	time.Sleep(10 * time.Second)
-	// testingConsumer.Close()
-
-	// c.partitionConsumer = &kmocks.PartitionConsumer{}
-	// pcha := make(chan cluster.PartitionConsumer, 1)
-	// pcha <- c.partitionConsumer
-	// c.saramaConsumer.On("Partitions").Return((<-chan cluster.PartitionConsumer)(pcha))
-	// c.saramaConsumer.On("Close").Return(nil)
-	// c.saramaConsumer.On("MarkPartitionOffset", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
-	// msg := &sarama.ConsumerMessage{}
-	// msg.Offset = 0
-	// msgCh := make(chan *sarama.ConsumerMessage, 1)
-	// msgCh <- msg
-	//
-	// pcha := make(chan cluster.PartitionConsumer, 1)
-	// pcha <- mockedConsumer
-	// // go func() {
-	// // 	pcha <- c.partitionConsumer
-	// // }()
-	// c.saramaConsumer.On("Partitions").Return((<-chan cluster.PartitionConsumer)(pcha))
-	//
-	// errCh := make(chan *sarama.ConsumerError, 1)
-	// c.partitionConsumer.On("Partition").Return(int32(0))
-	// c.partitionConsumer.On("Errors").Return((<-chan *sarama.ConsumerError)(errCh))
-	// c.partitionConsumer.On("Messages").Return((<-chan *sarama.ConsumerMessage)(msgCh))
-	// c.partitionConsumer.On("HighWaterMarkOffset").Return(int64(1234))
-	// c.partitionConsumer.On("Close").Return(nil)
-	//
-	//
-	// c.consumer.Start()
-	// time.Sleep(1000 * time.Millisecond)
-	// c.consumer.Close()
 }
