@@ -15,8 +15,6 @@
 package consumer
 
 import (
-	"sync"
-
 	"github.com/Shopify/sarama"
 	sc "github.com/bsm/sarama-cluster"
 	"github.com/uber/jaeger-lib/metrics"
@@ -24,6 +22,7 @@ import (
 
 	"github.com/jaegertracing/jaeger/cmd/ingester/app/processor"
 	"github.com/jaegertracing/jaeger/pkg/kafka/consumer"
+	"sync"
 )
 
 // Params are the parameters of a Consumer
@@ -42,18 +41,23 @@ type Consumer struct {
 	internalConsumer consumer.Consumer
 	processorFactory ProcessorFactory
 
-	close                     chan struct{}
-	partitionToProcessorState map[int32]*sync.WaitGroup
+	close              chan struct{}
+	partitionIDToState map[int32]*consumerState
+}
+
+type consumerState struct {
+	state             sync.WaitGroup
+	partitionConsumer sc.PartitionConsumer
 }
 
 // New is a constructor for a Consumer
 func New(params Params) (*Consumer, error) {
 	return &Consumer{
-		metricsFactory:   params.Factory,
-		logger:           params.Logger,
-		close:            make(chan struct{}, 1),
-		internalConsumer: params.InternalConsumer,
-		processorFactory: params.ProcessorFactory,
+		metricsFactory:     params.Factory,
+		logger:             params.Logger,
+		internalConsumer:   params.InternalConsumer,
+		processorFactory:   params.ProcessorFactory,
+		partitionIDToState: make(map[int32]*consumerState),
 	}, nil
 }
 
@@ -66,49 +70,31 @@ func (c *Consumer) Start() {
 // Close closes the Consumer and underlying sarama consumer
 func (c *Consumer) Close() error {
 	c.logger.Info("Closing consumer")
-
-	for k, wg := range c.partitionToProcessorState {
-		c.logger.Info("Waiting to close partition", zap.Int32("partition", k))
-		wg.Wait()
-		c.logger.Info("Closed partition", zap.Int32("partition", k))
+	for _, p := range c.partitionIDToState {
+		c.closePartition(p.partitionConsumer)
+		p.state.Wait()
 	}
-
-	err := c.internalConsumer.Close()
-	if err != nil {
-		return nil
-	}
-
-	return nil
+	return c.internalConsumer.Close()
 }
 
 func (c *Consumer) mainLoop() {
 	for {
-		select {
-		case pc := <-c.internalConsumer.Partitions():
-
-			if wg, ok := c.partitionToProcessorState[pc.Partition()]; ok {
-				wg.Wait()
-				delete(c.partitionToProcessorState, pc.Partition())
-			}
-			c.partitionToProcessorState[pc.Partition()] = &sync.WaitGroup{}
-
-			c.partitionToProcessorState[pc.Partition()].Add(1)
-			go c.handleMessages(pc)
-
-			c.partitionToProcessorState[pc.Partition()].Add(1)
-			go c.handleErrors(pc.Partition(), pc.Errors())
-
-		case <-c.close:
-			c.logger.Info("Closing main loop")
-			return
+		pc := <-c.internalConsumer.Partitions()
+		if p, ok := c.partitionIDToState[pc.Partition()]; ok {
+			p.state.Wait()
+			delete(c.partitionIDToState, pc.Partition())
 		}
+		c.partitionIDToState[pc.Partition()] = &consumerState{partitionConsumer: pc}
+		go c.handleMessages(pc)
+		go c.handleErrors(pc.Partition(), pc.Errors())
 	}
 }
 
 func (c *Consumer) handleMessages(pc sc.PartitionConsumer) {
 	c.logger.Info("Starting message handler")
+	c.partitionIDToState[pc.Partition()].state.Add(1)
+	defer c.partitionIDToState[pc.Partition()].state.Done()
 	defer c.closePartition(pc)
-	defer c.partitionToProcessorState[pc.Partition()].Done()
 
 	msgMetrics := c.newMsgMetrics(pc.Partition())
 	var msgProcessor processor.SpanProcessor
@@ -125,9 +111,8 @@ func (c *Consumer) handleMessages(pc sc.PartitionConsumer) {
 		}
 
 		msgProcessor.Process(&saramaMessageWrapper{msg})
-		c.logger.Info("finished processing messages")
 	}
-	c.logger.Info("finished handling messages")
+	c.logger.Debug("Finished handling messages")
 }
 
 func (c *Consumer) closePartition(partitionConsumer sc.PartitionConsumer) {
@@ -138,11 +123,13 @@ func (c *Consumer) closePartition(partitionConsumer sc.PartitionConsumer) {
 
 func (c *Consumer) handleErrors(partition int32, errChan <-chan *sarama.ConsumerError) {
 	c.logger.Info("Starting error handler")
-	defer c.partitionToProcessorState[partition].Done()
+	c.partitionIDToState[partition].state.Add(1)
+	defer c.partitionIDToState[partition].state.Done()
 
 	errMetrics := c.newErrMetrics(partition)
 	for err := range errChan {
 		errMetrics.errCounter.Inc(1)
 		c.logger.Error("Error consuming from Kafka", zap.Error(err))
 	}
+	c.logger.Debug("Finished handling errors")
 }
