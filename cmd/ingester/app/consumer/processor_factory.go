@@ -66,11 +66,19 @@ func (c *ProcessorFactory) new(partition int32, minOffset int64) processor.SpanP
 	}
 
 	om := offset.NewManager(minOffset, markOffset, partition, c.metricsFactory)
+	c.logger.Info("Created manager", zap.Int32("partition", partition))
 
 	retryProcessor := decorator.NewRetryingProcessor(c.metricsFactory, c.baseProcessor)
+	c.logger.Info("Created retryier", zap.Int32("partition", partition))
+
 	cp := NewCommittingProcessor(retryProcessor, om)
+	c.logger.Info("Created committer", zap.Int32("partition", partition))
+
 	spanProcessor := processor.NewDecoratedProcessor(c.metricsFactory, cp)
+	c.logger.Info("decorated with metrics", zap.Int32("partition", partition))
+
 	pp := processor.NewParallelProcessor(spanProcessor, c.parallelism, c.logger)
+	c.logger.Info("created pp", zap.Int32("partition", partition))
 
 	return newStartedProcessor(pp, om)
 }
@@ -109,10 +117,11 @@ func (c *startedProcessor) Process(message processor.Message) error {
 }
 
 func (c *startedProcessor) Close() error {
-	c.processor.Close()
-
 	for _, service := range c.services {
 		service.Close()
 	}
+
+	c.processor.Close()
+
 	return nil
 }
