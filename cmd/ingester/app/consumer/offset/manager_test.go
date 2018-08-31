@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/uber/jaeger-lib/metrics"
+	"go.uber.org/zap"
 )
 
 func TestHandleReset(t *testing.T) {
@@ -36,7 +37,7 @@ func TestHandleReset(t *testing.T) {
 		captureOffset = offset
 		wg.Done()
 	}
-	manager := NewManager(minOffset, fakeMarker, 1, m)
+	manager := NewManager(minOffset, fakeMarker, 1, m, zap.NewNop())
 	manager.Start()
 
 	manager.MarkOffset(offset)
@@ -55,7 +56,7 @@ func TestCache(t *testing.T) {
 	fakeMarker := func(offset int64) {
 		assert.Fail(t, "Shouldn't mark cached offset")
 	}
-	manager := NewManager(offset, fakeMarker, 1, metrics.NullFactory)
+	manager := NewManager(offset, fakeMarker, 1, metrics.NullFactory, zap.NewNop())
 	manager.Start()
 	time.Sleep(resetInterval + 50)
 	manager.MarkOffset(offset)

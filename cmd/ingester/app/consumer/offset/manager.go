@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/uber/jaeger-lib/metrics"
+	"go.uber.org/zap"
 )
 
 const (
@@ -41,24 +42,28 @@ type Manager struct {
 	markOffsetFunction  MarkOffset
 	offsetCommitCount   metrics.Counter
 	lastCommittedOffset metrics.Gauge
+	seppukuCounter      metrics.Counter
 	minOffset           int64
 	list                *ConcurrentList
 	close               chan struct{}
 	isClosed            sync.WaitGroup
+	logger              *zap.Logger
 }
 
 // MarkOffset is a func that marks offsets in Kafka
 type MarkOffset func(offset int64)
 
 // NewManager creates a new Manager
-func NewManager(minOffset int64, markOffset MarkOffset, partition int32, factory metrics.Factory) *Manager {
+func NewManager(minOffset int64, markOffset MarkOffset, partition int32, factory metrics.Factory, logger *zap.Logger) *Manager {
 	return &Manager{
 		markOffsetFunction:  markOffset,
 		close:               make(chan struct{}),
 		offsetCommitCount:   factory.Counter("offset-commits-total", map[string]string{"partition": strconv.Itoa(int(partition))}),
 		lastCommittedOffset: factory.Gauge("last-committed-offset", map[string]string{"partition": strconv.Itoa(int(partition))}),
+		seppukuCounter:      factory.Counter("offsetmanager-seppuku", map[string]string{"partition": strconv.Itoa(int(partition))}),
 		list:                newConcurrentList(minOffset),
 		minOffset:           minOffset,
+		logger:              logger,
 	}
 }
 
@@ -81,6 +86,11 @@ func (m *Manager) Start() {
 					m.lastCommittedOffset.Update(offset)
 					m.markOffsetFunction(offset)
 					lastCommittedOffset = offset
+				}
+
+				if len(m.list.offsets) > 100000 {
+					m.seppukuCounter.Inc(1)
+					m.logger.Panic("Committing seppuku because out of orderliness bounds for offsets exceeded")
 				}
 			case <-m.close:
 				m.isClosed.Done()
