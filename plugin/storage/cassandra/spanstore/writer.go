@@ -38,8 +38,8 @@ const (
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	insertTag = `
 		INSERT
-		INTO tag_index(trace_id, span_id, service_name, start_time, tag_key, tag_value)
-		VALUES (?, ?, ?, ?, ?, ?)`
+		INTO tag_index(trace_id, span_id, service_name, start_time, tag_key, tag_value, reserved)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`
 
 	serviceNameIndex = `
 		INSERT
@@ -54,8 +54,8 @@ const (
 
 	durationIndex = `
 		INSERT
-		INTO duration_index(service_name, operation_name, bucket, duration, start_time, trace_id)
-		VALUES (?, ?, ?, ?, ?, ?)`
+		INTO duration_index(service_name, operation_name, bucket, duration, start_time, trace_id, reserved)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`
 
 	maximumTagKeyOrValueSize = 256
 
@@ -205,7 +205,7 @@ func (s *SpanWriter) indexByTags(span *model.Span, ds *dbmodel.Span) error {
 		// we should introduce retries or just ignore failures imo, retrying each individual tag insertion might be better
 		// we should consider bucketing.
 		if s.shouldIndexTag(v) {
-			insertTagQuery := s.session.Query(insertTag, ds.TraceID, ds.SpanID, v.ServiceName, ds.StartTime, v.TagKey, v.TagValue)
+			insertTagQuery := s.session.Query(insertTag, ds.TraceID, ds.SpanID, v.ServiceName, ds.StartTime, v.TagKey, v.TagValue, true)
 			if err := s.writerMetrics.tagIndex.Exec(insertTagQuery, s.logger); err != nil {
 				withTagInfo := s.logger.
 					With(zap.String("tag_key", v.TagKey)).
@@ -225,7 +225,7 @@ func (s *SpanWriter) indexByDuration(span *dbmodel.Span, startTime time.Time) er
 	timeBucket := startTime.Round(durationBucketSize)
 	var err error
 	indexByOperationName := func(operationName string) {
-		q1 := query.Bind(span.Process.ServiceName, operationName, timeBucket, span.Duration, span.StartTime, span.TraceID)
+		q1 := query.Bind(span.Process.ServiceName, operationName, timeBucket, span.Duration, span.StartTime, span.TraceID, true)
 		if err2 := s.writerMetrics.durationIndex.Exec(q1, s.logger); err2 != nil {
 			s.logError(span, err2, "Cannot index duration", s.logger)
 			err = err2

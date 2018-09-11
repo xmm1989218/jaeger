@@ -67,8 +67,8 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.traces (
     PRIMARY KEY (trace_id, span_id, span_hash)
 )
     WITH compaction = {
-        'compaction_window_size': '1', 
-        'compaction_window_unit': 'HOURS', 
+        'compaction_window_size': '1',
+        'compaction_window_unit': 'HOURS',
         'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'
     }
     AND dclocal_read_repair_chance = 0.0
@@ -78,12 +78,13 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.traces (
 
 CREATE TABLE IF NOT EXISTS ${keyspace}.service_names (
     service_name text,
+    reserved     boolean,
     PRIMARY KEY (service_name)
 )
     WITH compaction = {
         'min_threshold': '4',
         'max_threshold': '32',
-        'class': 'org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy' 
+        'class': 'org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy'
     }
     AND dclocal_read_repair_chance = 0.0
     AND default_time_to_live = ${trace_ttl}
@@ -93,6 +94,7 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.service_names (
 CREATE TABLE IF NOT EXISTS ${keyspace}.operation_names (
     service_name        text,
     operation_name      text,
+    reserved            boolean,
     PRIMARY KEY ((service_name), operation_name)
 )
     WITH compaction = {
@@ -114,8 +116,8 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.service_operation_index (
     PRIMARY KEY ((service_name, operation_name), start_time)
 ) WITH CLUSTERING ORDER BY (start_time DESC)
     AND compaction = {
-        'compaction_window_size': '1', 
-        'compaction_window_unit': 'HOURS', 
+        'compaction_window_size': '1',
+        'compaction_window_unit': 'HOURS',
         'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'
     }
     AND dclocal_read_repair_chance = 0.0
@@ -131,8 +133,8 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.service_name_index (
     PRIMARY KEY ((service_name, bucket), start_time)
 ) WITH CLUSTERING ORDER BY (start_time DESC)
     AND compaction = {
-        'compaction_window_size': '1', 
-        'compaction_window_unit': 'HOURS', 
+        'compaction_window_size': '1',
+        'compaction_window_unit': 'HOURS',
         'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'
     }
     AND dclocal_read_repair_chance = 0.0
@@ -147,11 +149,12 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.duration_index (
     duration        bigint,    // span duration, in microseconds
     start_time      bigint,
     trace_id        blob,
+    reserved        boolean,
     PRIMARY KEY ((service_name, operation_name, bucket), duration, start_time, trace_id)
 ) WITH CLUSTERING ORDER BY (duration DESC, start_time DESC)
     AND compaction = {
-        'compaction_window_size': '1', 
-        'compaction_window_unit': 'HOURS', 
+        'compaction_window_size': '1',
+        'compaction_window_unit': 'HOURS',
         'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'
     }
     AND dclocal_read_repair_chance = 0.0
@@ -168,12 +171,13 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.tag_index (
     start_time      bigint,
     trace_id        blob,
     span_id         bigint,
+    reserved        boolean,
     PRIMARY KEY ((service_name, tag_key, tag_value), start_time, trace_id, span_id)
 )
     WITH CLUSTERING ORDER BY (start_time DESC)
     AND compaction = {
-        'compaction_window_size': '1', 
-        'compaction_window_unit': 'HOURS', 
+        'compaction_window_size': '1',
+        'compaction_window_unit': 'HOURS',
         'class': 'org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy'
     }
     AND dclocal_read_repair_chance = 0.0
@@ -202,6 +206,6 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.dependencies (
     }
     AND default_time_to_live = ${dependencies_ttl};
 
-CREATE CUSTOM INDEX IF NOT EXISTS ON ${keyspace}.dependencies (ts_index) 
-    USING 'org.apache.cassandra.index.sasi.SASIIndex' 
+CREATE CUSTOM INDEX IF NOT EXISTS ON ${keyspace}.dependencies (ts_index)
+    USING 'org.apache.cassandra.index.sasi.SASIIndex'
     WITH OPTIONS = {'mode': 'SPARSE'};

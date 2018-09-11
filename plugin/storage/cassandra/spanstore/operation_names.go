@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	insertOperationName = `INSERT INTO operation_names(service_name, operation_name) VALUES (?, ?)`
+	insertOperationName = `INSERT INTO operation_names(service_name, operation_name, reserved) VALUES (?, ?, ?)`
 	queryOperationNames = `SELECT operation_name FROM operation_names WHERE service_name = ?`
 )
 
@@ -71,7 +71,7 @@ func (s *OperationNamesStorage) Write(serviceName string, operationName string) 
 	var err error
 	query := s.session.Query(s.InsertStmt)
 	if inCache := checkWriteCache(serviceName+"|"+operationName, s.operationNames, s.writeCacheTTL); !inCache {
-		q := query.Bind(serviceName, operationName)
+		q := query.Bind(serviceName, operationName, true)
 		err2 := s.metrics.Exec(q, s.logger)
 		if err2 != nil {
 			err = err2
