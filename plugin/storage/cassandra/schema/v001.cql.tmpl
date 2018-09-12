@@ -78,7 +78,6 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.traces (
 
 CREATE TABLE IF NOT EXISTS ${keyspace}.service_names (
     service_name text,
-    reserved     boolean,
     PRIMARY KEY (service_name)
 )
     WITH compaction = {
@@ -94,7 +93,6 @@ CREATE TABLE IF NOT EXISTS ${keyspace}.service_names (
 CREATE TABLE IF NOT EXISTS ${keyspace}.operation_names (
     service_name        text,
     operation_name      text,
-    reserved            boolean,
     PRIMARY KEY ((service_name), operation_name)
 )
     WITH compaction = {
